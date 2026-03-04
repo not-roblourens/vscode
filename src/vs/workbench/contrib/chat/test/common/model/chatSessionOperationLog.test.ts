@@ -575,5 +575,113 @@ suite('ChatSessionOperationLog', () => {
 
 			assert.deepStrictEqual(result.metadata, { tags: ['b', 'c'] });
 		});
+
+		test('detects in-place mutation on object-valued array items (regression: thinking part generatedTitle)', () => {
+			// This is a regression test for https://github.com/microsoft/vscode/issues/295377.
+			// Thinking parts are plain objects mutated in place when the generatedTitle arrives.
+			// The differ must snapshot the extracted value so the later title mutation is detected.
+			interface ThinkingLike {
+				kind: 'thinking';
+				value: string;
+				generatedTitle?: string;
+			}
+
+			interface ResponseParts {
+				parts: ThinkingLike[];
+			}
+
+			const partSchema = Adapt.v<ThinkingLike, ThinkingLike>(
+				obj => ({ ...obj }), // snapshot on extract
+				(a, b) => equals(a, b), // deep equality — 'thinking' is dynamic
+			);
+
+			const schema = Adapt.object<ResponseParts, ResponseParts>({
+				parts: Adapt.t(o => o.parts, Adapt.array(partSchema)),
+			});
+
+			const adapter = new Adapt.ObjectMutationLog(schema);
+
+			// Initial push: thinking part without a title (as it arrives during streaming)
+			const thinkingPart: ThinkingLike = { kind: 'thinking', value: 'I am thinking...' };
+			adapter.createInitial({ parts: [thinkingPart] });
+
+			// Title arrives later — mutates the part object in place (the actual bug scenario)
+			thinkingPart.generatedTitle = 'Generated Title';
+
+			// The differ must detect the change even though the same object reference was mutated
+			const result = adapter.write({ parts: [thinkingPart] });
+			assert.notStrictEqual(result.data.toString(), '', 'generatedTitle mutation must be detected');
+
+			const entry = JSON.parse(result.data.toString().trim());
+			assert.strictEqual(entry.kind, 2); // EntryKind.Push — array item replaced
+			assert.deepStrictEqual(entry.v, [{ kind: 'thinking', value: 'I am thinking...', generatedTitle: 'Generated Title' }]);
+		});
+
+		test('sealed request with pending thinking title stays unsealed until title arrives', () => {
+			// Regression for https://github.com/microsoft/vscode/issues/295377.
+			// A request in a terminal state (Complete/Cancelled/Failed) is normally sealed and
+			// skips all diffing. But if the thinking title hasn't arrived yet, the request must
+			// stay unsealed so the title change is captured on the next write.
+			interface ThinkingLike {
+				kind: 'thinking';
+				value: string;
+				generatedTitle?: string;
+			}
+			interface ModelState {
+				value: number; // 0 = in-progress, 1 = complete
+			}
+			interface Request {
+				id: string;
+				modelState?: ModelState;
+				parts: ThinkingLike[];
+			}
+			interface Root {
+				requests: Request[];
+			}
+
+			const partSchema = Adapt.v<ThinkingLike, ThinkingLike>(
+				obj => ({ ...obj }),
+				(a, b) => equals(a, b),
+			);
+
+			// Sealed when terminal AND all thinking parts have a title.
+			const requestSchema = Adapt.object<Request, Request>({
+				id: Adapt.t(r => r.id, Adapt.key()),
+				modelState: Adapt.v(r => r.modelState, equals),
+				parts: Adapt.t(r => r.parts, Adapt.array(partSchema)),
+			}, {
+				sealed: (o) => {
+					const isTerminal = o.modelState?.value === 1;
+					const hasPendingTitle = o.parts.some(p => p.kind === 'thinking' && p.value && p.generatedTitle === undefined);
+					return isTerminal && !hasPendingTitle;
+				},
+			});
+
+			const schema = Adapt.object<Root, Root>({
+				requests: Adapt.t(r => r.requests, Adapt.array(requestSchema)),
+			});
+
+			const adapter = new Adapt.ObjectMutationLog(schema);
+
+			// Step 1: response in-progress, thinking part has no title yet
+			const thinkingPart: ThinkingLike = { kind: 'thinking', value: 'Reasoning...' };
+			adapter.createInitial({ requests: [{ id: 'req1', modelState: { value: 0 }, parts: [thinkingPart] }] });
+
+			// Step 2: response completes, still no title
+			const r2 = adapter.write({ requests: [{ id: 'req1', modelState: { value: 1 }, parts: [thinkingPart] }] });
+			assert.notStrictEqual(r2.data.toString(), '', 'should write modelState change');
+
+			// Step 3: title arrives (in-place mutation), write again
+			thinkingPart.generatedTitle = 'My Thinking Title';
+			const r3 = adapter.write({ requests: [{ id: 'req1', modelState: { value: 1 }, parts: [thinkingPart] }] });
+			assert.notStrictEqual(r3.data.toString(), '', 'must detect title even though request is terminal');
+			const lines3 = r3.data.toString().trim().split('\n');
+			const titleEntry = JSON.parse(lines3[lines3.length - 1]);
+			assert.deepStrictEqual(titleEntry.v, [{ kind: 'thinking', value: 'Reasoning...', generatedTitle: 'My Thinking Title' }]);
+
+			// Step 4: no more changes — request is now fully sealed
+			const r4 = adapter.write({ requests: [{ id: 'req1', modelState: { value: 1 }, parts: [thinkingPart] }] });
+			assert.strictEqual(r4.data.toString(), '', 'sealed request with title must produce no diff');
+		});
 	});
 });

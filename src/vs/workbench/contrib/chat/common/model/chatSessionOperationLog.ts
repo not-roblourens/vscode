@@ -9,7 +9,7 @@ import { equals as objectsEqual } from '../../../../../base/common/objects.js';
 import { isEqual as _urisEqual } from '../../../../../base/common/resources.js';
 import { hasKey } from '../../../../../base/common/types.js';
 import { URI, UriComponents } from '../../../../../base/common/uri.js';
-import { IChatMarkdownContent, ResponseModelState } from '../chatService/chatService.js';
+import { IChatMarkdownContent, IChatThinkingPart, ResponseModelState } from '../chatService/chatService.js';
 import { ModifiedFileEntryState } from '../editing/chatEditingService.js';
 import { IParsedChatRequest } from '../requestParser/chatParserTypes.js';
 import { IChatAgentEditedFileEvent, IChatDataSerializerLog, IChatModel, IChatPendingRequest, IChatProgressResponseContent, IChatRequestModel, IChatRequestVariableData, ISerializableChatData, ISerializableChatModelInputState, ISerializableChatRequestData, ISerializablePendingRequestData, SerializedChatResponsePart, serializeSendOptions } from './chatModel.js';
@@ -61,6 +61,7 @@ const responsePartSchema = Adapt.v<IChatProgressResponseContent, SerializedChatR
 				case 'textEditGroup':
 				case 'multiDiffData':
 				case 'mcpServersStarting':
+				case 'thinking': // generatedTitle can arrive after the part is initially pushed
 					return objectsEqual(a, b);
 
 				// Static types that won't change after being pushed can use strict equality.
@@ -76,7 +77,6 @@ const responsePartSchema = Adapt.v<IChatProgressResponseContent, SerializedChatR
 				case 'progressMessage':
 				case 'pullRequest':
 				case 'questionCarousel':
-				case 'thinking':
 				case 'undoStop':
 				case 'warning':
 				case 'treeData':
@@ -101,6 +101,25 @@ const responsePartSchema = Adapt.v<IChatProgressResponseContent, SerializedChatR
 
 const urisEqual = (a: UriComponents, b: UriComponents): boolean => {
 	return _urisEqual(URI.from(a), URI.from(b));
+};
+
+/**
+ * Returns true if the response contains a thinking part whose generatedTitle
+ * has not yet been set. Title generation is async and happens after the response
+ * reaches a terminal state, so we must not seal the request until the title
+ * arrives — otherwise the differ would skip the response array diff entirely.
+ */
+const hasPendingThinkingTitleGeneration = (response: ReadonlyArray<SerializedChatResponsePart> | undefined): boolean => {
+	if (!response) {
+		return false;
+	}
+	for (let i = response.length - 1; i >= 0; i--) {
+		const part = response[i];
+		if (hasKey(part, { kind: true }) && (part as IChatThinkingPart).kind === 'thinking' && (part as IChatThinkingPart).value) {
+			return (part as IChatThinkingPart).generatedTitle === undefined;
+		}
+	}
+	return false;
 };
 
 const messageSchema = Adapt.object<IParsedChatRequest, IParsedChatRequest>({
@@ -149,7 +168,15 @@ const requestSchema = Adapt.object<IChatRequestModel, ISerializableChatRequestDa
 	codeCitations: Adapt.v(m => m.response?.codeCitations, objectsEqual),
 	timeSpentWaiting: Adapt.v(m => m.response?.timestamp), // based on response timestamp
 }, {
-	sealed: (o) => o.modelState?.value === ResponseModelState.Cancelled || o.modelState?.value === ResponseModelState.Failed || o.modelState?.value === ResponseModelState.Complete,
+	sealed: (o) => {
+		const modelState = o.modelState?.value;
+		const isTerminal = modelState === ResponseModelState.Cancelled
+			|| modelState === ResponseModelState.Failed
+			|| modelState === ResponseModelState.Complete;
+		// Don't seal yet if the thinking title hasn't arrived — title generation is async
+		// and happens after the response reaches a terminal state.
+		return isTerminal && !hasPendingThinkingTitleGeneration(o.response);
+	},
 });
 
 const inputStateSchema = Adapt.object<ISerializableChatModelInputState, ISerializableChatModelInputState>({
