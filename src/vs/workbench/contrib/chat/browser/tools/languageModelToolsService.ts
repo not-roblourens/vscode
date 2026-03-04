@@ -688,9 +688,15 @@ export class LanguageModelToolsService extends Disposable implements ILanguageMo
 			}
 
 			toolResult ??= { content: [] };
-			toolResult.toolResultError = err instanceof Error ? err.message : String(err);
-			if (tool.data.alwaysDisplayInputOutput) {
-				toolResult.toolResultDetails = { input: this.formatToolInput(dto), output: [{ type: 'embed', isText: true, value: String(err) }], isError: true };
+			if (isCancellationError(err)) {
+				// For cancellation, use the standard user-facing message rather than
+				// String(new CancellationError()) which produces 'Canceled: Canceled'.
+				toolResult.toolResultError = 'The user cancelled the tool call.';
+			} else {
+				toolResult.toolResultError = err instanceof Error ? err.message : String(err);
+				if (tool.data.alwaysDisplayInputOutput) {
+					toolResult.toolResultDetails = { input: this.formatToolInput(dto), output: [{ type: 'embed', isText: true, value: String(err) }], isError: true };
+				}
 			}
 
 			throw err;
